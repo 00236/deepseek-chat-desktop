@@ -1,0 +1,10 @@
+node_modules/
+dist/
+dist-electron/
+*.log
+.DS_Store
+Thumbs.db
+.vscode/
+.env
+.env.*
+*.local
