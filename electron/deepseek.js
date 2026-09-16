@@ -71,6 +71,10 @@ function streamChat(opts) {
 
     const body = JSON.stringify(payload);
 
+    // 空闲超时：连接建立后若连续 120 秒未收到任何数据（含首包），
+    // 视为请求挂起，主动断开并报错，避免界面永久卡在"生成中"
+    const IDLE_TIMEOUT_MS = 120000;
+
     const req = lib.request(
       {
         hostname: url.hostname,
@@ -154,6 +158,13 @@ function streamChat(opts) {
     req.on('error', (e) => {
       onError && onError(e.message);
       reject(e);
+    });
+
+    req.setTimeout(IDLE_TIMEOUT_MS, () => {
+      req.destroy();
+      const msg = `请求超时：${IDLE_TIMEOUT_MS / 1000} 秒未收到任何响应数据，连接已中断，请重试。`;
+      onError && onError(msg);
+      resolve();
     });
 
     if (signal) {

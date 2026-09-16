@@ -54,12 +54,33 @@ function fileToDataUrl(file) {
   });
 }
 
+// 字节数格式化（附件展示用）
+function fmtSize(bytes) {
+  if (!bytes && bytes !== 0) return '';
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / 1024 / 1024).toFixed(1) + ' MB';
+}
+
+// 把上传文档组装成附在消息正文后的文本块
+function docTextBlock(docs) {
+  if (!docs || docs.length === 0) return '';
+  return docs
+    .map((d) =>
+      `\n\n---\n【用户上传的文档：${d.name}】\n${d.text || ''}${d.truncated ? '\n（注：该文档过长，上方内容已截断）' : ''}\n---`
+    )
+    .join('');
+}
+
 // 把消息对象组装成 DeepSeek/OpenAI 兼容的 content
 // 含图片的 user 消息用数组格式；其余用字符串
 function buildApiMessage(msg, nickname = '') {
+  // 上传文档：文本注入消息正文（历史消息同样携带，保证多轮追问时文档内容仍在上下文中）
+  const docBlock = docTextBlock(msg.docs);
+  const baseText = (msg.content || '') + docBlock;
   if (msg.role === 'user' && msg.images && msg.images.length > 0) {
     const parts = [];
-    if (msg.content) parts.push({ type: 'text', text: msg.content });
+    if (baseText) parts.push({ type: 'text', text: baseText });
     for (const url of msg.images) {
       parts.push({ type: 'image_url', image_url: { url } });
     }
@@ -75,7 +96,9 @@ function buildApiMessage(msg, nickname = '') {
       : `${who}发了${msg.stickers.length}个"抹茶旦旦"表情包（${tagText}），没说话。`;
     parts.push({
       type: 'text',
-      text: `${intro}像朋友斗图那样自然回应：结合聊天上下文体会TA想表达的情绪，直接接话（口语化、简短），或者回敬表情也行。不要描述图片内容，除非TA明确问图里是什么。你也可以用 [表情:标签] 回敬表情包。`
+      text: docBlock
+        ? `${intro}同时${who}上传了文档附件（见文末文档内容），请一并处理。像朋友斗图那样自然回应：结合聊天上下文体会TA想表达的情绪，直接接话（口语化、简短），或者回敬表情也行。不要描述图片内容，除非TA明确问图里是什么。你也可以用 [表情:标签] 回敬表情包。${docBlock}`
+        : `${intro}像朋友斗图那样自然回应：结合聊天上下文体会TA想表达的情绪，直接接话（口语化、简短），或者回敬表情也行。不要描述图片内容，除非TA明确问图里是什么。你也可以用 [表情:标签] 回敬表情包。`
     });
     for (const s of msg.stickers) {
       parts.push({ type: 'image_url', image_url: { url: s.src } });
@@ -93,13 +116,13 @@ function buildApiMessage(msg, nickname = '') {
       content: [
         {
           type: 'text',
-          text: `${who}发来一个"抹茶旦旦"表情包${known}。像朋友之间斗图那样对待它：结合你们正在聊的话题和气氛，体会TA此刻想传达的情绪或言外之意，然后直接自然地接话。口语化、简短，像真人回消息；不要描述图片内容，不要用列表，除非TA明确问你图里是什么。你也可以用 [表情:标签] 回敬一个表情包。`
+          text: `${who}发来一个"抹茶旦旦"表情包${known}。像朋友之间斗图那样对待它：结合你们正在聊的话题和气氛，体会TA此刻想传达的情绪或言外之意，然后直接自然地接话。口语化、简短，像真人回消息；不要描述图片内容，不要用列表，除非TA明确问你图里是什么。你也可以用 [表情:标签] 回敬一个表情包。${docBlock}`
         },
         { type: 'image_url', image_url: { url: msg.sticker } }
       ]
     };
   }
-  return { role: msg.role, content: msg.content };
+  return { role: msg.role, content: baseText };
 }
 
 /**
@@ -158,13 +181,16 @@ export default function App() {
   const [toast, setToast] = useState(null);
   const [pendingImages, setPendingImages] = useState([]); // 待发送 dataURL
   const [pendingStickers, setPendingStickers] = useState([]); // 待发送表情包（暂存，与文字一起或单独发送）
+  const [pendingDocs, setPendingDocs] = useState([]); // 待发送文档附件（主进程已提取文本）
+  const [pickingFiles, setPickingFiles] = useState(false); // 附件对话框打开中
   const [dragging, setDragging] = useState(false);
   const [deviceId, setDeviceId] = useState('');
   const messagesEndRef = useRef(null);
-  const fileInputRef = useRef(null);
   // 用 ref 保存当前活跃会话 id，避免流式回调里的闭包过期
   // （否则新建/切换会话后，AI 增量会写进旧会话，表现为"不回复"）
   const activeIdRef = useRef(activeId);
+  // 用户主动点击"停止"时为 true，用于区分"主动中断"与"模型空回复"
+  const stopRequestedRef = useRef(false);
 
   useEffect(() => {
     activeIdRef.current = activeId;
@@ -181,10 +207,39 @@ export default function App() {
 
     window.electronAPI.chat.onDelta((delta) => appendDeltaToActive(delta));
     window.electronAPI.chat.onReasoning((delta) => appendReasoningToActive(delta));
-    window.electronAPI.chat.onDone(() => setStreaming(false));
+    window.electronAPI.chat.onDone((full) => {
+      setStreaming(false);
+      // 清理既无正文也无思考过程的空 assistant 消息
+      setSessions((prev) =>
+        prev.map((s) => {
+          if (s.id !== activeIdRef.current) return s;
+          const msgs = s.messages.filter(
+            (m) => !(m.role === 'assistant' && !m.content && !m.reasoning)
+          );
+          return { ...s, messages: msgs };
+        })
+      );
+      // 模型没返回任何正文时给出明确提示（主动中断的情况除外）
+      if (String(full || '').trim() === '' && !stopRequestedRef.current) {
+        showToast('模型本次没有返回内容，可以再发一次试试', true);
+      }
+      stopRequestedRef.current = false;
+    });
     window.electronAPI.chat.onError((err) => {
       setStreaming(false);
+      stopRequestedRef.current = false;
       showToast('出错了：' + err, true);
+      // 移除空的流式占位消息，避免留下"（无内容）"的空壳
+      // （已输出部分内容的消息保留原样）
+      setSessions((prev) =>
+        prev.map((s) => {
+          if (s.id !== activeIdRef.current) return s;
+          const msgs = s.messages.filter(
+            (m) => !(m.role === 'assistant' && m.streaming && !m.content)
+          );
+          return { ...s, messages: msgs };
+        })
+      );
     });
   }, []);
 
@@ -218,6 +273,7 @@ export default function App() {
     setActiveId(s.id);
     setInput('');
     setPendingImages([]);
+    setPendingDocs([]);
   }
 
   function newDramaProject() {
@@ -226,6 +282,7 @@ export default function App() {
     setActiveId(s.id);
     setInput('');
     setPendingImages([]);
+    setPendingDocs([]);
   }
 
   // 更新当前创作项目的配置（题材/受众/调性/集数/结局）
@@ -283,24 +340,95 @@ export default function App() {
     );
   }
 
-  // ============ 图片处理 ============
-  async function handleFiles(files) {
-    const imageFiles = Array.from(files).filter((f) => f.type.startsWith('image/'));
-    if (imageFiles.length === 0) {
-      showToast('只支持图片文件', true);
-      return;
+  // ============ 附件处理（图片 + 文档） ============
+  // 主进程解析结果 → 分拣进待发送区：图片压缩后进 pendingImages，文档进 pendingDocs
+  async function ingestFilePayloads(payloads) {
+    let docCount = 0;
+    for (const p of payloads || []) {
+      if (!p) continue;
+      if (p.error) {
+        showToast(`「${p.name}」${p.error}`, true);
+        continue;
+      }
+      if (p.kind === 'image' && p.dataUrl) {
+        try {
+          const compressed = await compressImage(p.dataUrl);
+          setPendingImages((prev) => [...prev, compressed]);
+        } catch (e) {
+          showToast(`图片「${p.name}」处理失败：${e.message}`, true);
+        }
+      } else if (p.kind === 'doc') {
+        setPendingDocs((prev) => [
+          ...prev,
+          {
+            id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+            name: p.name,
+            text: p.text || '',
+            truncated: !!p.truncated,
+            size: p.size || 0,
+            emptyNote: p.text ? '' : (p.note || '未能提取到文本内容')
+          }
+        ]);
+        docCount++;
+      }
     }
+    if (docCount > 0) showToast(`已添加 ${docCount} 个文档附件`);
+  }
+
+  // 文件选择对话框（📎 按钮）
+  async function pickFiles() {
+    if (pickingFiles) return;
+    setPickingFiles(true);
     try {
-      const dataUrls = await Promise.all(imageFiles.map(fileToDataUrl));
-      const compressed = await Promise.all(dataUrls.map((u) => compressImage(u)));
-      setPendingImages((prev) => [...prev, ...compressed]);
+      const payloads = await window.electronAPI.files.pick();
+      await ingestFilePayloads(payloads);
     } catch (e) {
-      showToast('图片读取失败：' + e.message, true);
+      showToast('文件选择失败：' + e.message, true);
+    } finally {
+      setPickingFiles(false);
+    }
+  }
+
+  // 拖拽 / 粘贴进来的 File 对象
+  async function handleFiles(files) {
+    const arr = Array.from(files || []);
+    if (arr.length === 0) return;
+    const paths = [];
+    const blobs = [];
+    for (const f of arr) {
+      // Electron 中来自磁盘的拖拽文件带本地路径；粘贴的截图等是内存 Blob
+      if (f.path) paths.push(f.path);
+      else blobs.push(f);
+    }
+    const imageBlobs = blobs.filter((f) => f.type && f.type.startsWith('image/'));
+    if (blobs.length > imageBlobs.length) {
+      showToast('仅支持拖拽/粘贴图片，文档请用 📎 按钮选择', true);
+    }
+    if (imageBlobs.length > 0) {
+      try {
+        const dataUrls = await Promise.all(imageBlobs.map(fileToDataUrl));
+        const compressed = await Promise.all(dataUrls.map((u) => compressImage(u)));
+        setPendingImages((prev) => [...prev, ...compressed]);
+      } catch (e) {
+        showToast('图片读取失败：' + e.message, true);
+      }
+    }
+    if (paths.length > 0) {
+      try {
+        const payloads = await window.electronAPI.files.read(paths);
+        await ingestFilePayloads(payloads);
+      } catch (e) {
+        showToast('文件读取失败：' + e.message, true);
+      }
     }
   }
 
   function removePendingImage(idx) {
     setPendingImages((prev) => prev.filter((_, i) => i !== idx));
+  }
+
+  function removePendingDoc(id) {
+    setPendingDocs((prev) => prev.filter((d) => d.id !== id));
   }
 
   function onPaste(e) {
@@ -337,47 +465,69 @@ export default function App() {
 
   // ============ 发送 ============
   // stageKey 传入时为"阶段指令"发送：注入阶段提示词（界面以紧凑卡片显示，不刷屏）
+  // 注意：只有合法的阶段 key 字符串才走阶段分支——避免把鼠标事件等真值误当阶段
   async function sendMessage(stageKey) {
+    const validStage =
+      typeof stageKey === 'string' && STAGES.some((s) => s.key === stageKey) ? stageKey : '';
     const text = input.trim();
     const hasImages = pendingImages.length > 0;
     const hasStickers = pendingStickers.length > 0;
-    if (stageKey) {
-      if (streaming) return;
-    } else if ((!text && !hasImages && !hasStickers) || streaming) {
-      return;
+    const hasDocs = pendingDocs.length > 0;
+    if (validStage) {
+      if (streaming) return false;
+    } else if ((!text && !hasImages && !hasStickers && !hasDocs) || streaming) {
+      return false;
     }
     if (!settings?.apiKey) {
       setShowSettings(true);
       showToast('请先在设置中填入 API Key', true);
-      return;
+      return false;
     }
 
     const targetSessionId = activeId;
     const activeSession = sessions.find((s) => s.id === targetSessionId);
 
     let content, stage = undefined;
-    if (stageKey) {
+    if (validStage) {
       // 阶段指令 = 阶段提示词模板 + 项目设定 + 用户补充输入
-      content = buildStageInstruction(stageKey, activeSession?.drama, text);
-      stage = stageKey;
+      content = buildStageInstruction(validStage, activeSession?.drama, text);
+      stage = validStage;
     } else {
-      content = text || (hasStickers ? '' : '请描述这张图片。');
+      if (text) {
+        content = text;
+      } else if (hasStickers && !hasImages && !hasDocs) {
+        content = ''; // 纯表情包斗图，无需文字
+      } else if (hasDocs && hasImages) {
+        content = '请分析附件中的文档和图片。';
+      } else if (hasDocs && hasStickers) {
+        content = '结合附件文档聊聊。';
+      } else if (hasDocs) {
+        content = '请阅读附件文档并总结要点。';
+      } else {
+        content = '请描述这张图片。';
+      }
     }
 
-    const images = !stageKey && hasImages ? [...pendingImages] : undefined;
-    const stickers = !stageKey && hasStickers ? [...pendingStickers] : undefined;
-    const userMsg = { role: 'user', content, images, stickers, stage };
+    const images = !stage && hasImages ? [...pendingImages] : undefined;
+    const stickers = !stage && hasStickers ? [...pendingStickers] : undefined;
+    const docs = !stage && hasDocs ? [...pendingDocs] : undefined;
+    const userMsg = { role: 'user', content, images, stickers, docs, stage };
     const aiPlaceholder = { role: 'assistant', content: '', streaming: true };
 
     setSessions((prev) =>
       prev.map((s) => {
         if (s.id !== targetSessionId) return s;
         const msgs = [...s.messages, userMsg, aiPlaceholder];
+        const fallbackTitle = hasStickers
+          ? '表情包'
+          : hasDocs
+            ? `文档：${pendingDocs[0].name}`
+            : '识别图片';
         const newTitle =
           s.messages.length === 0
             ? (stage
                 ? '剧本项目·' + (s.drama?.genre || '未定题材')
-                : (text || (hasStickers ? '表情包' : '识别图片')).slice(0, 20) + (text.length > 20 ? '…' : ''))
+                : (text || fallbackTitle).slice(0, 20) + ((text || fallbackTitle).length > 20 ? '…' : ''))
             : s.title;
         return { ...s, messages: msgs, title: newTitle };
       })
@@ -386,12 +536,21 @@ export default function App() {
     setInput('');
     setPendingImages([]);
     setPendingStickers([]);
+    setPendingDocs([]);
     setStreaming(true);
+    stopRequestedRef.current = false;
 
     // 构造 API messages：系统提示词（含用户身份记忆）
     const apiMessages = buildSystemMessages(activeSession, settings);
     for (const m of activeSession.messages) {
-      if (m.role && (m.content || (m.images && m.images.length) || m.sticker || (m.stickers && m.stickers.length))) {
+      if (
+        m.role &&
+        (m.content ||
+          (m.images && m.images.length) ||
+          m.sticker ||
+          (m.stickers && m.stickers.length) ||
+          (m.docs && m.docs.length))
+      ) {
         apiMessages.push(buildApiMessage(m, settings.nickname));
       }
     }
@@ -434,6 +593,8 @@ export default function App() {
       );
       setStreaming(false);
     }
+    // 返回 true 表示消息已进入发送流程（供 UI 收起表情面板等后续动作判断）
+    return true;
   }
 
   // 表情包暂存：点击表情不立即发送，进入待发送区（可搭配文字一起发送，或直接点发送）
@@ -449,6 +610,7 @@ export default function App() {
   }
 
   async function stopStreaming() {
+    stopRequestedRef.current = true;
     await window.electronAPI.chat.abort();
     setStreaming(false);
     setSessions((prev) =>
@@ -482,7 +644,8 @@ export default function App() {
     lines.push('', '---', '');
     for (const m of s.messages) {
       if (m.role === 'user') {
-        lines.push(`## 🧑 ${m.stage ? `阶段指令（${STAGES.find((x) => x.key === m.stage)?.label || m.stage}）` : '用户'}`, '', m.content, '');
+        const docNote = m.docs?.length ? `（附件：${m.docs.map((d) => d.name).join('、')}）` : '';
+        lines.push(`## 🧑 ${m.stage ? `阶段指令（${STAGES.find((x) => x.key === m.stage)?.label || m.stage}）` : '用户'}${docNote}`, '', m.content, '');
       } else if (m.role === 'assistant' && m.content) {
         lines.push('## 🤖 DeepSeek', '', m.content, '');
       }
@@ -510,7 +673,11 @@ export default function App() {
   }
 
   const activeSession = sessions.find((s) => s.id === activeId);
-  const canSend = input.trim().length > 0 || pendingImages.length > 0 || pendingStickers.length > 0;
+  const canSend =
+    input.trim().length > 0 ||
+    pendingImages.length > 0 ||
+    pendingStickers.length > 0 ||
+    pendingDocs.length > 0;
 
   return (
     <div className="app">
@@ -539,11 +706,12 @@ export default function App() {
         dragging={dragging}
         pendingImages={pendingImages}
         pendingStickers={pendingStickers}
-        onPickImage={() => fileInputRef.current?.click()}
+        pendingDocs={pendingDocs}
+        pickingFiles={pickingFiles}
+        onPickFile={pickFiles}
         onRemoveImage={removePendingImage}
+        onRemoveDoc={removePendingDoc}
         onRemoveSticker={removePendingSticker}
-        fileInputRef={fileInputRef}
-        onFilesPicked={handleFiles}
         canSend={canSend}
         messagesEndRef={messagesEndRef}
         apiKeyReady={!!settings?.apiKey}
@@ -604,8 +772,8 @@ function ChatArea(props) {
   const {
     session, model, input, setInput, onSend, onStop, streaming, onKeyDown,
     onPaste, onDrop, onDragOver, onDragLeave, dragging,
-    pendingImages, pendingStickers, onPickImage, onRemoveImage, onRemoveSticker,
-    fileInputRef, onFilesPicked,
+    pendingImages, pendingStickers, pendingDocs, pickingFiles,
+    onPickFile, onRemoveImage, onRemoveDoc, onRemoveSticker,
     canSend, messagesEndRef, apiKeyReady, onOpenSettings, onUpdateDrama, onExport,
     onAddSticker
   } = props;
@@ -627,6 +795,26 @@ function ChatArea(props) {
   }, [input]);
 
   const isEmpty = session.messages.length === 0;
+
+  // 发送后自动收起表情面板（↑ 按钮 / Enter / 阶段按钮统一走这里）
+  // onSend 返回 false 表示未实际发送（空消息/正在流式输出等），此时保持面板不动
+  async function handleSend(...args) {
+    const sent = await onSend(...args);
+    if (sent !== false) setShowStickers(false);
+    return sent;
+  }
+
+  function handleKeyDown(e) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      Promise.resolve(onSend()).then((sent) => {
+        if (sent !== false) setShowStickers(false);
+      });
+      return;
+    }
+    onKeyDown(e);
+  }
+
   return (
     <main className="chat-area">
       <div className="chat-header">
@@ -642,7 +830,7 @@ function ChatArea(props) {
         <DramaToolbar
           drama={drama}
           onUpdate={onUpdateDrama}
-          onRunStage={(key) => onSend(key)}
+          onRunStage={(key) => handleSend(key)}
           streaming={streaming}
         />
       )}
@@ -661,6 +849,7 @@ function ChatArea(props) {
               role={m.role}
               content={m.content}
               images={m.images}
+              docs={m.docs}
               reasoning={m.reasoning}
               streaming={m.streaming}
               stage={m.stage}
@@ -713,7 +902,7 @@ function ChatArea(props) {
               </div>
             </div>
           )}
-          {(pendingImages.length > 0 || pendingStickers.length > 0) && (
+          {(pendingImages.length > 0 || pendingStickers.length > 0 || pendingDocs.length > 0) && (
             <div className="attachments">
               {pendingStickers.map((s) => (
                 <div className="att sticker-att" key={s.id} title={`${s.tag}：${s.desc}`}>
@@ -728,6 +917,20 @@ function ChatArea(props) {
                   <button className="remove" title="移除" onClick={() => onRemoveImage(i)}>×</button>
                 </div>
               ))}
+              {pendingDocs.map((d) => (
+                <div
+                  className="att doc-att"
+                  key={d.id}
+                  title={d.truncated ? `${d.name}（内容过长已截断）` : d.name}
+                >
+                  <span className="doc-icon">📄</span>
+                  <span className="doc-meta">
+                    <span className="doc-name">{d.name}</span>
+                    <span className="doc-size">{fmtSize(d.size)}{d.truncated ? ' · 已截断' : ''}</span>
+                  </span>
+                  <button className="remove" title="移除" onClick={() => onRemoveDoc(d.id)}>×</button>
+                </div>
+              ))}
             </div>
           )}
           <div className="input-row">
@@ -736,7 +939,12 @@ function ChatArea(props) {
               title="抹茶旦旦表情包"
               onClick={() => setShowStickers((v) => !v)}
             >🐊</button>
-            <button className="upload-btn" title="上传图片（识别）" onClick={onPickImage}>＋</button>
+            <button
+              className="upload-btn"
+              title="上传文件（文档 / 图片）"
+              disabled={pickingFiles}
+              onClick={onPickFile}
+            >📎</button>
             <textarea
               ref={textareaRef}
               rows={1}
@@ -744,29 +952,18 @@ function ChatArea(props) {
               placeholder={apiKeyReady
                 ? (isDrama
                     ? '补充要求（可选），点击上方阶段按钮执行；Enter 直接对话'
-                    : '输入消息，Enter 发送，Shift+Enter 换行；可拖拽/粘贴图片')
+                    : '输入消息，Enter 发送，Shift+Enter 换行；可发图片 / 文档 / 表情包')
                 : '请先在设置中配置 API Key'}
               onChange={(e) => setInput(e.target.value)}
-              onKeyDown={onKeyDown}
+              onKeyDown={handleKeyDown}
               onPaste={onPaste}
             />
             {streaming ? (
               <button className="send-btn stop" title="停止" onClick={onStop}>■</button>
             ) : (
-              <button className="send-btn" title="发送" onClick={onSend} disabled={!canSend}>↑</button>
+              <button className="send-btn" title="发送" onClick={() => handleSend()} disabled={!canSend}>↑</button>
             )}
           </div>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="image/*"
-            multiple
-            style={{ display: 'none' }}
-            onChange={(e) => {
-              if (e.target.files?.length) onFilesPicked(e.target.files);
-              e.target.value = '';
-            }}
-          />
         </div>
         <div className="input-hint">内容由 AI 生成，请甄别使用。对话仅保存在内存，关闭软件后清空。</div>
       </div>
@@ -821,7 +1018,7 @@ function renderWithStickers(content) {
   return nodes;
 }
 
-function Message({ role, content, images, reasoning, streaming, stage, sticker, stickers }) {
+function Message({ role, content, images, docs, reasoning, streaming, stage, sticker, stickers }) {
   const isUser = role === 'user';
   const showCursor = streaming && !content;
   // 阶段指令消息：紧凑卡片显示，点击展开完整提示词
@@ -842,6 +1039,18 @@ function Message({ role, content, images, reasoning, streaming, stage, sticker, 
           <img className="sticker-img" src={sticker} alt="抹茶旦旦表情包" />
         ) : (
           <>
+            {docs && docs.length > 0 && (
+              // 用户上传的文档附件：以文件卡片展示
+              <div className="doc-chips">
+                {docs.map((d) => (
+                  <span
+                    className="doc-chip"
+                    key={d.id}
+                    title={d.truncated ? `${d.name}（内容过长已截断）` : d.name}
+                  >📄 {d.name}</span>
+                ))}
+              </div>
+            )}
             {stickers && stickers.length > 0 && (
               // 表情包消息（新版）：表情图 + 可选文字
               <div className="sticker-msg">
@@ -992,6 +1201,7 @@ function EmptyState({ apiKeyReady, onOpenSettings, isDrama }) {
         <div className="feat"><span className="icon">💬</span><span>多会话</span></div>
         <div className="feat"><span className="icon">⚡</span><span>流式输出</span></div>
         <div className="feat"><span className="icon">🖼️</span><span>图片识别</span></div>
+        <div className="feat"><span className="icon">📄</span><span>文档解析</span></div>
       </div>
       {!apiKeyReady && (
         <div className="hint">

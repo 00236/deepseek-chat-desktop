@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const Store = require('./store');
 const { streamChat, abortChat } = require('./deepseek');
+const { readFilePayloads, FILE_FILTERS } = require('./files');
 
 const isDev = process.env.DEV === 'true';
 
@@ -34,6 +35,8 @@ function createWindow() {
 }
 
 app.whenReady().then(async () => {
+  // 始终开启辅助功能树（屏幕阅读器 / 自动化工具可稳定读取界面）
+  app.setAccessibilitySupportEnabled(true);
   // 离线模式：批量标注表情包语义（ANALYZE_STICKERS=1），不创建窗口
   if (process.env.ANALYZE_STICKERS === '1') {
     try {
@@ -119,6 +122,24 @@ ipcMain.handle('chat:abort', async () => {
     currentAbortController = null;
   }
   return { ok: true };
+});
+
+/* ============ IPC: 附件文件（文档 / 图片） ============ */
+// 弹出系统选择框，返回解析后的附件 payload 数组
+ipcMain.handle('files:pick', async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: '上传文件（文档 / 图片）',
+    buttonLabel: '添加',
+    properties: ['openFile', 'multiSelections'],
+    filters: FILE_FILTERS
+  });
+  if (result.canceled || !result.filePaths?.length) return [];
+  return readFilePayloads(result.filePaths);
+});
+
+// 按路径读取（拖拽文件时渲染进程拿到的是本地路径）
+ipcMain.handle('files:read', (_event, paths) => {
+  return readFilePayloads(Array.isArray(paths) ? paths.filter((p) => typeof p === 'string') : []);
 });
 
 /* ============ IPC: 导出剧本为 Markdown 文件 ============ */

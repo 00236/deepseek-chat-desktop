@@ -1,6 +1,6 @@
 {
   "name": "deepseek-chat-desktop",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Windows 桌面 AI 聊天软件 - 接入 DeepSeek API",
   "author": "Local",
   "main": "electron/main.js",
@@ -33,8 +33,11 @@
   },
   "dependencies": {
     "electron-store": "8.1.0",
+    "mammoth": "^1.12.3",
+    "pdfjs-dist": "^3.11.174",
     "react-markdown": "^10.1.0",
-    "remark-gfm": "^4.0.1"
+    "remark-gfm": "^4.0.1",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.2.1",

@@ -73,6 +73,7 @@ export const STAGES = [
  * @param {string} userText 用户附加输入（可为空）
  */
 export function buildStageInstruction(stageKey, drama = {}, userText = '') {
+  drama = drama || {};
   const cfg = [
     `题材：${drama.genre || '未指定'}`,
     `受众：${drama.audience || '未指定'}`,

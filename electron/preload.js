@@ -17,6 +17,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
     onDone: (cb) => ipcRenderer.on('chat:done', (_e, full) => cb(full)),
     onError: (cb) => ipcRenderer.on('chat:error', (_e, err) => cb(err))
   },
+  files: {
+    pick: () => ipcRenderer.invoke('files:pick'),
+    read: (paths) => ipcRenderer.invoke('files:read', paths)
+  },
   export: {
     markdown: (payload) => ipcRenderer.invoke('export:markdown', payload)
   }
